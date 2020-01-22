@@ -1,11 +1,13 @@
 'use strict';
 
+const ByteArray = imports.byteArray;
 const Gio = imports.gi.Gio;
 const GLib = imports.gi.GLib;
 const GObject = imports.gi.GObject;
 
 const Core = imports.service.protocol.core;
 const DBus = imports.service.components.dbus;
+const Multiplex = imports.service.protocol.multiplex;
 
 
 /**
@@ -81,6 +83,7 @@ const BluezNode = Gio.DBusNodeInfo.new_for_xml(`
  * Proxy for org.bluez.Adapter1 interface
  */
 const DEVICE_INFO = BluezNode.lookup_interface('org.bluez.Device1');
+const PROFILE_INFO = BluezNode.lookup_interface('org.bluez.Profile1');
 const PROFILE_MANAGER_INFO = BluezNode.lookup_interface('org.bluez.ProfileManager1');
 
 const ProfileManager1Proxy = DBus.makeInterfaceProxy(PROFILE_MANAGER_INFO);
@@ -103,7 +106,7 @@ const SERVICE_PROFILE = {
  */
 var ChannelService = GObject.registerClass({
     GTypeName: 'GSConnectBluetoothChannelService',
-    Implements: [Gio.DBusInterface],
+    Implements: [Gio.DBusInterface, Core.ChannelService],
     Properties: {
         'devices': GObject.param_spec_variant(
             'devices',
@@ -112,7 +115,8 @@ var ChannelService = GObject.registerClass({
             new GLib.VariantType('as'),
             null,
             GObject.ParamFlags.READABLE
-        )
+        ),
+        'name': GObject.ParamSpec.override('name', Core.ChannelService)
     }
 }, class ChannelService extends Gio.DBusProxy {
 
@@ -124,6 +128,8 @@ var ChannelService = GObject.registerClass({
             g_interface_name: 'org.freedesktop.DBus.ObjectManager',
             g_flags: Gio.DBusProxyFlags.DO_NOT_AUTO_START_AT_CONSTRUCTION
         });
+
+        this._started = false;
 
         // Watch the service
         this._nameOwnerChangedId = this.connect(
@@ -144,8 +150,8 @@ var ChannelService = GObject.registerClass({
         return devices.filter(device => device.UUIDs.includes(SERVICE_UUID));
     }
 
-    get service() {
-        return Gio.Application.get_default();
+    get name() {
+        return 'bluetooth';
     }
 
     /**
@@ -224,28 +230,23 @@ var ChannelService = GObject.registerClass({
                 g_object_path: object_path,
                 g_interface_name: 'org.bluez.Device1'
             });
+            await proxy.init_promise();
 
-            // Initialize the device proxy
-            await new Promise((resolve, reject) => {
-                proxy.init_async(
-                    GLib.PRIORITY_DEFAULT,
-                    null,
-                    (proxy, res) => {
-                        try {
-                            resolve(proxy.init_finish(res));
-                        } catch (e) {
-                            reject(e);
-                        }
-                    }
-                );
-            });
-
-            // Properties and Methods
+            // Initialize properties and methods
             DBus.proxyMethods(proxy, DEVICE_INFO);
             DBus.proxyProperties(proxy, DEVICE_INFO);
 
+            //
+            proxy.close = function() {
+                if (this._muxer) {
+                    debug(`GSConnect: Disconnecting ${this.Alias}`);
+                    this._muxer.close();
+                    this._muxer = null;
+                }
+            };
+
             // Set a null channel
-            proxy._channel = null;
+            proxy._muxer = null;
 
             return proxy;
         } catch (e) {
@@ -337,7 +338,25 @@ var ChannelService = GObject.registerClass({
 
     async _onNameOwnerChanged() {
         try {
-            if (this.g_name_owner === null) {
+            if (this._started && this.g_name_owner !== null) {
+                // Get a profile manager
+                this._profileManager = new ProfileManager1Proxy({
+                    g_bus_type: Gio.BusType.SYSTEM,
+                    g_name: 'org.bluez',
+                    g_object_path: '/org/bluez'
+                });
+                await this._profileManager.init_promise();
+
+                // Register the service profile
+                await this._register(SERVICE_UUID);
+
+                // Add current devices
+                let objects = await this._getManagedObjects();
+
+                for (let [object_path, object] of Object.entries(objects)) {
+                    await this._onInterfacesAdded(object_path, object);
+                }
+            } else {
                 // Ensure we've removed all devices before restarting
                 for (let device of this._devices.values()) {
                     device.disconnect(device.__deviceChangedId);
@@ -353,25 +372,6 @@ var ChannelService = GObject.registerClass({
                 if (this._profileManager) {
                     this._profileManager.destroy();
                     this._profileManager = null;
-                }
-
-                await this._getManagedObjects();
-            } else {
-                // Get a profile manager
-                this._profileManager = new ProfileManager1Proxy({
-                    g_bus_type: Gio.BusType.SYSTEM,
-                    g_name: 'org.bluez',
-                    g_object_path: '/org/bluez'
-                });
-                await this._profileManager.init_promise();
-
-                // Register the service profile
-                await this._register(SERVICE_UUID);
-
-                let objects = await this._getManagedObjects();
-
-                for (let [object_path, object] of Object.entries(objects)) {
-                    await this._onInterfacesAdded(object_path, object);
                 }
             }
         } catch (e) {
@@ -396,8 +396,7 @@ var ChannelService = GObject.registerClass({
                 (proxy, res) => {
                     try {
                         let variant = proxy.call_finish(res);
-                        let objects = variant.deep_unpack()[0];
-                        resolve(objects);
+                        resolve(variant.deep_unpack()[0]);
                     } catch (e) {
                         reject(e);
                     }
@@ -414,7 +413,7 @@ var ChannelService = GObject.registerClass({
     async _connectDevice(iface) {
         try {
             // This device already has a connected or connecting channel
-            if (iface._channel) {
+            if (iface._muxer) {
                 debug('already connected', iface.Alias);
                 return;
             }
@@ -455,43 +454,33 @@ var ChannelService = GObject.registerClass({
     async NewConnection(object_path, fd, fd_properties) {
         debug(`(${object_path}, ${fd}, ${JSON.stringify(fd_properties)})`);
 
-        let bdevice = this._devices.get(object_path);
+        let bludev = this._devices.get(object_path);
 
         try {
             // Create a Gio.SocketConnection from the file-descriptor
-            let socket = Gio.Socket.new_from_fd(fd);
-            let connection = socket.connection_factory_create_connection();
-            let channel = new Core.Channel();
-
-            // TODO: We can't differentiate incoming or outgoing connections so
-            // we treat this as outgoing and write our identity to the socket
-            connection = await channel._sendIdent(connection);
-
-            // Accept the connection
-            await channel.accept(connection);
-
-            bdevice._channel = channel;
-            let _id = channel.cancellable.connect(() => {
-                channel.cancellable.disconnect(_id);
-                bdevice._channel = null;
+            let connection = new Gio.SocketConnection({
+                socket: Gio.Socket.new_from_fd(fd)
             });
 
-            channel.identity.body.bluetoothHost = bdevice.Address;
-            channel.identity.body.bluetoothPath = bdevice.g_object_path;
+            bludev._muxer = new Multiplex.Connection(connection);
+            bludev._muxer.cancellable.connect(bludev.close.bind(bludev));
 
-            // Unlike Lan channels, we accept all new connections since they
-            // have to be paired over bluetooth anyways
-            let device = await this.service._ensureDevice(channel.identity);
+            // TODO: We can't differentiate incoming or outgoing connections so
+            // Channel.negotiate() will decide based on the first message
+            let channel = bludev._muxer._default;
+            await channel.handshake(connection);
 
-            // Attach a device to the channel
-            channel.attach(device);
+            channel.identity.body.bluetoothHost = bludev.Address;
+            channel.identity.body.bluetoothPath = bludev.g_object_path;
+
+            this.channel(channel);
         } catch (e) {
-            if (bdevice._channel !== null) {
-                bdevice._channel.close();
-                bdevice._channel = null;
+            if (bludev._muxer !== null) {
+                bludev._muxer.close();
+                bludev._muxer = null;
             }
 
-            debug(e, bdevice.Alias);
+            debug(e, bludev.Alias);
         }
     }
 
@@ -513,88 +502,70 @@ var ChannelService = GObject.registerClass({
         debug(object_path);
 
         try {
-            let device = this._devices.get(object_path);
+            let bludev = this._devices.get(object_path);
 
-            if (device && device._channel !== null) {
-                debug(`GSConnect: Disconnecting ${device.Alias}`);
-                device._channel.close();
-                device._channel = null;
+            if (bludev) {
+                bludev.close();
             }
         } catch (e) {
             // Silence errors (for now)
         }
     }
 
-    broadcast(object_path) {
-        try {
-            let device = this._devices.get(object_path);
+    broadcast(object_path = null) {
+        debug('Identifying');
 
-            if (device) {
-                this._connectDevice(device);
+        if (object_path === null) {
+            for (let bludev of this._devices.values()) {
+                debug(bludev.Alias);
+                this._connectDevice(bludev);
             }
-        } catch (e) {
-            debug(e, object_path);
+        } else {
+            let bludev = this._devices.get(object_path);
+
+            if (bludev) {
+                this._connectDevice(bludev);
+            }
         }
+    }
+
+    start() {
+        if (this._started)
+            return;
+
+        this._started = true;
+        this._onNameOwnerChanged();
+    }
+
+    stop() {
+        if (!this._started)
+            return;
+
+        this._started = false;
+        this._onNameOwnerChanged();
     }
 
     destroy() {
         this.disconnect(this._nameOwnerChangedId);
 
         for (let device of this._devices.values()) {
-            if (device._channel !== null) {
-                device._channel.close();
-                device._channel = null;
+            if (device._muxer !== null) {
+                device._muxer.close();
+                device._muxer = null;
             }
         }
 
         if (this._profile) {
             this._profile.destroy();
         }
+
+        if (this._profileManager) {
+            this._profileManager.destroy();
+            this._profileManager = null;
+        }
     }
 });
 
 
-/**
- * TODO: Bluetooth Base Channel
- */
-var Channel = class Channel extends Core.Channel {
-
-    get type() {
-        return 'bluetooth';
-    }
-};
-
-
-/**
- * TODO: Bluetooth Transfer Channel
- */
-var Transfer = class Transfer extends Channel {
-
-    /**
-     * @param {object} params - Transfer parameters
-     * @param {Device.Device} params.device - The device that owns this transfer
-     * @param {Gio.InputStream} params.input_stream - The input stream (read)
-     * @param {Gio.OutputStream} params.output_stream - The output stream (write)
-     * @param {number} params.size - The size of the transfer in bytes
-     */
-    constructor(params) {
-        super(params);
-
-        // The device tracks transfers it owns so they can be closed from the
-        // notification action.
-        this.device._transfers.set(this.uuid, this);
-    }
-
-    get identity() {
-        return this.device._channel.identity;
-    }
-
-    /**
-     * Override to untrack the transfer UUID
-     */
-    close() {
-        this.device._transfers.delete(this.uuid);
-        super.close();
-    }
-};
+var Transfer = Multiplex.Transfer;
 

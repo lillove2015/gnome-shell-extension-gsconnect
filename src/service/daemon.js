@@ -478,7 +478,7 @@ const Service = GObject.registerClass({
 
     _initBackends() {
         let backends = [
-            //'bluetooth',
+            'bluetooth',
             'lan'
         ];
 
